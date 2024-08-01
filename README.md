@@ -19,4 +19,4 @@ It is not enough to just copy the core dump file and the main binary, you also n
 
 # Caveat
 
-This program is not fool proof. Since it mangles with the executable files, it is possible that it can do something wrong and break them. Especially if changing the RPATH changed offsets of data inside the executable. Report a bug if this doesn't work.
+This program is not fool proof. Since it mangles with the executable files, it is possible that it can do something wrong and break them. Report a bug if this doesn't work.

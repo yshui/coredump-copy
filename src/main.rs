@@ -268,15 +268,6 @@ impl ZeroOne for u32 {
     }
 }
 
-#[link(name = "patchelf")]
-#[link(name = "stdc++")]
-extern "C" {
-    fn patchelf_run() -> bool;
-    fn patchelf_set_input(name: *const i8);
-    fn patchelf_set_rpath(name: *const i8);
-    fn patchelf_clear();
-}
-
 fn get_soname(file: impl AsRef<Path>) -> Option<Vec<u8>> {
     let file = file.as_ref();
     let data = std::fs::read(file).ok()?;
@@ -397,14 +388,14 @@ where
                                 });
                             }
                         }
-                        unsafe {
-                            let cpath =
-                                std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-                            patchelf_set_input(cpath.as_ptr());
-                            patchelf_set_rpath(c"$ORIGIN".as_ptr() as *const i8);
-                            patchelf_run();
-                            patchelf_clear();
-                        }
+                        //unsafe {
+                        //    let cpath =
+                        //        std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                        //    patchelf_set_input(cpath.as_ptr());
+                        //    patchelf_set_rpath(c"$ORIGIN".as_ptr() as *const i8);
+                        //    patchelf_run();
+                        //    patchelf_clear();
+                        //}
                     }
                 }
                 copied.insert(src_path.to_path_buf());
