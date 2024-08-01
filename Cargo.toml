@@ -1,0 +1,14 @@
+[package]
+name = "coredump-copy"
+version = "0.1.1"
+edition = "2021"
+description = "Copy coredumps for debugging on a different machine"
+license = "MIT"
+
+[dependencies]
+object = { version = "0.36.2", default-features = false, features = ["elf", "read_core", "write_std"] }
+anyhow = "1.0.86"
+env_logger = "0.11.5"
+log = "0.4.22"
+elf = "0.7.4"
+patchelf = "0.2.1"
