@@ -1,9 +1,7 @@
 use std::{
     collections::HashSet,
     ffi::{OsStr, OsString},
-    fmt::{Display, LowerHex},
     mem::MaybeUninit,
-    ops::{Add, AddAssign, BitAnd, Not, Sub},
     os::unix::{ffi::OsStrExt as _, fs::PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -16,14 +14,18 @@ use object::{
     read::elf::{Dyn as _, ElfFile, FileHeader, ProgramHeader},
     Object,
 };
+use vm::Pod as _;
 
-trait BitWidth {
+trait BitWidth: Copy + Clone {
     /// SAFETY: the slice must be at least `Self::BYTES` long.
     unsafe fn from_bytes(bytes: &[u8], endian: impl object::Endian) -> Self;
     /// SAFETY: the slice must be at least `Self::BYTES` long.
     unsafe fn to_bytes(&self, endian: impl object::Endian, bytes: &mut [MaybeUninit<u8>]);
     fn as_usize(&self) -> usize;
     fn from_u64(val: u64) -> Self;
+    /// Convert the value from `endian` to the native endian.
+    fn to_native_endian(&self, endian: impl object::Endian) -> Self;
+    fn from_native_endian(&self, endian: impl object::Endian) -> Self;
 }
 impl BitWidth for u32 {
     unsafe fn from_bytes(bytes: &[u8], endian: impl object::Endian) -> Self {
@@ -39,6 +41,12 @@ impl BitWidth for u32 {
     fn from_u64(val: u64) -> Self {
         Self::try_from(val).unwrap()
     }
+    fn to_native_endian(&self, endian: impl object::Endian) -> Self {
+        endian.read_u32(*self)
+    }
+    fn from_native_endian(&self, endian: impl object::Endian) -> Self {
+        endian.write_u32(*self)
+    }
 }
 impl BitWidth for u64 {
     unsafe fn from_bytes(bytes: &[u8], endian: impl object::Endian) -> Self {
@@ -53,6 +61,12 @@ impl BitWidth for u64 {
     }
     fn from_u64(val: u64) -> Self {
         val
+    }
+    fn to_native_endian(&self, endian: impl object::Endian) -> Self {
+        endian.read_u64(*self)
+    }
+    fn from_native_endian(&self, endian: impl object::Endian) -> Self {
+        endian.write_u64(*self)
     }
 }
 
@@ -140,13 +154,25 @@ fn find_dt_debug_vaddr<F: FileHeader>(elf: &ElfFile<F>) -> Option<u64> {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone, Copy)]
 struct RDebug<Ptr: BitWidth> {
     r_version: u32,
     r_map: Ptr,
     r_brk: Ptr,
     r_state: u32,
     r_ldbase: Ptr,
+}
+
+impl<Ptr: BitWidth + Into<u64> + Copy> std::fmt::Debug for RDebug<Ptr> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RDebug")
+            .field("r_version", &self.r_version)
+            .field("r_map", &self.r_map.into())
+            .field("r_brk", &self.r_brk.into())
+            .field("r_state", &self.r_state)
+            .field("r_ldbase", &self.r_ldbase.into())
+            .finish()
+    }
 }
 
 #[repr(C)]
@@ -159,6 +185,7 @@ struct RawLinkMap<Ptr: BitWidth> {
     l_prev: Ptr,
 }
 
+#[derive(Debug)]
 struct LinkMap {
     addr: u64,
     name: Vec<u8>,
@@ -205,56 +232,59 @@ impl LinkMap {
     }
 }
 
-/// Pod
-///
-/// # Safety
-///
-/// Must be plain old data.
-unsafe trait Pod: Sized {
-    fn read_from_vm(vm: &vm::Vm, vaddr: u64, endian: impl object::Endian) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let mut buf = std::mem::MaybeUninit::<Self>::uninit();
-        let this = unsafe {
-            let buf_slice = std::slice::from_raw_parts_mut(
-                buf.as_mut_ptr().cast(),
-                std::mem::size_of::<Self>(),
-            );
-            vm.read_into_uninit(vaddr, buf_slice)?;
-            buf.assume_init()
-        };
-        Ok(this)
+explicitly_size!(RDebug<u32>);
+explicitly_size!(RDebug<u64>);
+
+unsafe impl<Ptr: BitWidth> vm::Pod for RDebug<Ptr>
+where
+    Self: vm::ExplicitlySized,
+{
+    fn fix_endian(&mut self, endian: impl object::Endian) {
+        self.r_version = self.r_version.to_native_endian(endian);
+        self.r_map = self.r_map.to_native_endian(endian);
+        self.r_brk = self.r_brk.to_native_endian(endian);
+        self.r_state = self.r_state.to_native_endian(endian);
+        self.r_ldbase = self.r_ldbase.to_native_endian(endian);
     }
-    fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                self as *const Self as *const u8,
-                std::mem::size_of::<Self>(),
-            )
-        }
+    fn as_bytes(&self, endian: impl object::Endian) -> <Self as vm::ExplicitlySized>::CopyArr<u8> {
+        let foreign_endian = Self {
+            r_version: self.r_version.from_native_endian(endian),
+            r_map: self.r_map.from_native_endian(endian),
+            r_brk: self.r_brk.from_native_endian(endian),
+            r_state: self.r_state.from_native_endian(endian),
+            r_ldbase: self.r_ldbase.from_native_endian(endian),
+        };
+        unsafe { *(&foreign_endian as *const _ as *const _) }
     }
 }
-unsafe impl<Ptr: BitWidth> Pod for RDebug<Ptr> {}
-unsafe impl<Ptr: BitWidth> Pod for RawLinkMap<Ptr> {}
+
+explicitly_size!(RawLinkMap<u32>);
+explicitly_size!(RawLinkMap<u64>);
+
+unsafe impl<Ptr: BitWidth> vm::Pod for RawLinkMap<Ptr>
+where
+    Self: vm::ExplicitlySized,
+{
+    fn fix_endian(&mut self, endian: impl object::Endian) {
+        self.l_addr = self.l_addr.to_native_endian(endian);
+        self.l_name = self.l_name.to_native_endian(endian);
+        self.l_ld = self.l_ld.to_native_endian(endian);
+        self.l_next = self.l_next.to_native_endian(endian);
+        self.l_prev = self.l_prev.to_native_endian(endian);
+    }
+    fn as_bytes(&self, _endian: impl object::Endian) -> <Self as vm::ExplicitlySized>::CopyArr<u8> {
+        unimplemented!("Don't write RawLinkMap directly, use LinkMap::write")
+    }
+}
 
 fn handle_elf<F: object::read::elf::FileHeader>(
     elf: &ElfFile<F>,
     base_dir: impl AsRef<Path>,
 ) -> Result<()>
 where
-    <F as FileHeader>::Word: Copy
-        + AddAssign
-        + Add<Output = <F as FileHeader>::Word>
-        + BitAnd<Output = <F as FileHeader>::Word>
-        + PartialOrd
-        + Sub<Output = <F as FileHeader>::Word>
-        + Not<Output = <F as FileHeader>::Word>
-        + LowerHex
-        + TryFrom<usize>
-        + TryFrom<u64>
-        + BitWidth
-        + std::fmt::Debug,
+    <F as FileHeader>::Word: Copy + TryFrom<usize> + TryFrom<u64> + BitWidth,
+    RDebug<F::Word>: vm::Pod,
+    RawLinkMap<F::Word>: vm::Pod,
     <<F as FileHeader>::Word as TryFrom<u64>>::Error: std::error::Error + Send + Sync,
     <<F as FileHeader>::Word as TryFrom<usize>>::Error: std::error::Error + Send + Sync,
 {
@@ -342,27 +372,28 @@ where
 
     let vm = vm::Vm::load_object(elf)?;
     let r_debug = vm.read_ptr(dt_debug, elf.endian())?;
-    let mut r_debug = RDebug::<F::Word>::read_from_vm(&vm, r_debug, elf.endian())?;
-    log::info!("r_debug: {r_debug:x?}");
+    let mut r_debug = vm.read_pod::<RDebug<F::Word>>(r_debug, elf.endian())?;
+    log::info!("r_debug: {:x?}", r_debug);
     let mut link_map = r_debug.r_map;
     let mut name_buf = Vec::new();
     let mut link_map_size = std::mem::size_of::<RDebug<F::Word>>();
     let mut link_maps = Vec::new();
     while link_map.into() != 0 {
-        let lmap = RawLinkMap::<F::Word>::read_from_vm(&vm, link_map.into(), elf.endian())?;
-        vm.read_until_nul(lmap.l_name.into(), &mut name_buf)?;
+        let raw_lmap = vm.read_pod::<RawLinkMap<F::Word>>(link_map.into(), elf.endian())?;
+        vm.read_until_nul(raw_lmap.l_name.into(), &mut name_buf)?;
+        let lmap = LinkMap {
+            addr: raw_lmap.l_addr.into(),
+            name: name_buf.clone(),
+            ld: raw_lmap.l_ld.into(),
+            next: raw_lmap.l_next.into(),
+            prev: raw_lmap.l_prev.into(),
+        };
         log::info!(
             "link_map: {lmap:x?}, file name: {:?}",
             std::str::from_utf8(&name_buf)
         );
-        link_maps.push(LinkMap {
-            addr: lmap.l_addr.into(),
-            name: name_buf.clone(),
-            ld: lmap.l_ld.into(),
-            next: lmap.l_next.into(),
-            prev: lmap.l_prev.into(),
-        });
-        link_map = lmap.l_next;
+        link_maps.push(lmap);
+        link_map = raw_lmap.l_next;
 
         let src_path = std::path::Path::new(OsStr::from_bytes(&name_buf));
         let Some(filename) = src_path.file_name() else {
@@ -426,7 +457,7 @@ where
     link_map_end = free_addr + std::mem::size_of::<RDebug<F::Word>>() as u64;
 
     let mut new_link_map = Vec::new();
-    new_link_map.extend_from_slice(r_debug.as_bytes());
+    new_link_map.extend_from_slice(r_debug.as_bytes(elf.endian()).as_ref());
     let mut prev = 0;
     let link_maps_len = link_maps.len();
     for (i, lmap) in link_maps.iter_mut().enumerate() {

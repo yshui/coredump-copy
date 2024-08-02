@@ -27,7 +27,7 @@ impl<'a> MappedFileAny<'a> {
     }
 }
 
-struct NtFile<'data, T> {
+pub struct NtFile<'data, T> {
     count: T,
     pagesz: T,
     name: &'data [u8],
@@ -135,11 +135,17 @@ impl<'a> NtFileAny<'a> {
             NtFileAny::NtFile64(nt_file) => serialize_nt_note(endian, nt_file, data),
         }
     }
+    pub fn pagesz(&self) -> u64 {
+        match self {
+            NtFileAny::NtFile32(nt_file) => nt_file.pagesz as u64,
+            NtFileAny::NtFile64(nt_file) => nt_file.pagesz,
+        }
+    }
     pub fn parse<'b, F: FileHeader>(note: &'b Note<'a, F>, endian: F::Endian) -> Result<Self> {
         if F::is_type_64_sized() {
-            Ok(NtFileAny::NtFile64(parse_nt_file(endian, &note)?))
+            Ok(NtFileAny::NtFile64(parse_nt_file(endian, note)?))
         } else {
-            Ok(NtFileAny::NtFile32(parse_nt_file(endian, &note)?))
+            Ok(NtFileAny::NtFile32(parse_nt_file(endian, note)?))
         }
     }
     pub fn files(&self) -> impl Iterator<Item = MappedFileAny<'_>> {

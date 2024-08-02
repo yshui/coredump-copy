@@ -54,8 +54,17 @@ impl<'a> Vm<'a> {
         let addr_size = obj.architecture().address_size().unwrap() as u8;
         for segment in obj.elf_program_headers() {
             if segment.p_type(obj.endian()) != object::elf::PT_LOAD {
+                log::debug!(
+                    "Segment at {:x} is not PT_LOAD",
+                    segment.p_vaddr(obj.endian()).into()
+                );
                 continue;
             }
+            log::debug!(
+                "Inserting segment at {:x} with size {:x}",
+                segment.p_vaddr(obj.endian()).into(),
+                segment.p_memsz(obj.endian()).into()
+            );
             vma.insert(
                 segment.p_vaddr(obj.endian()).into(),
                 Segment {
@@ -185,4 +194,66 @@ impl<'a> Vm<'a> {
         }
         None
     }
+    pub fn read_pod<T: Pod>(&self, vaddr: u64, endian: impl object::Endian) -> Result<T>
+    where
+        Self: Sized,
+    {
+        let mut buf = std::mem::MaybeUninit::<T>::uninit();
+        let mut this = unsafe {
+            let buf_slice =
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), std::mem::size_of::<T>());
+            self.read_into_uninit(vaddr, buf_slice)?;
+            buf.assume_init()
+        };
+        this.fix_endian(endian);
+        Ok(this)
+    }
+    #[allow(dead_code, reason = "placeholder")]
+    fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+/// Pod
+///
+/// # Safety
+///
+/// Must be plain old data.
+pub unsafe trait Pod: ExplicitlySized + Sized {
+    fn fix_endian(&mut self, endian: impl object::Endian);
+    fn as_bytes(&self, endian: impl object::Endian) -> <Self as ExplicitlySized>::CopyArr<u8>;
+}
+
+/// A trait for storing size information about a type
+///
+/// This is needed to workaround the limitation of not being able to use
+/// `std::mem::size_of` in const generics. (#![feature(genric_const_exprs)]).
+///
+/// # Safety
+///
+/// This must faithfully represent the size of the type. Don't implement this
+/// by hand, use the `explicitly_size!` macro.
+pub unsafe trait ExplicitlySized {
+    #[allow(dead_code, reason = "For completeness")]
+    const SIZE: usize;
+    type Arr<T>: AsRef<[T]> + AsMut<[T]>;
+    type CopyArr<T>: AsRef<[T]> + AsMut<[T]> + Clone + Copy
+    where
+        T: Copy + Clone;
+}
+
+#[macro_export]
+macro_rules! explicitly_size {
+    ($t:ty) => {
+        unsafe impl $crate::vm::ExplicitlySized for $t {
+            const SIZE: usize = std::mem::size_of::<$t>();
+            type Arr<T> = [T; std::mem::size_of::<$t>()];
+            type CopyArr<T> = [T; std::mem::size_of::<$t>()] where T: Copy + Clone;
+        }
+    };
 }

@@ -26,13 +26,21 @@ const ELF_PRARGSZ: usize = 80;
 
 pub struct PsInfo<'a> {
     pub fname: &'a [u8],
+    #[allow(dead_code, reason = "for completeness")]
     pub psargs: &'a [u8],
 }
 
 impl<'a> PsInfo<'a> {
     pub fn parse<F: FileHeader>(note: &Note<'a, F>, endian: F::Endian) -> Self {
         assert!(note.n_type(endian) == object::elf::NT_PRPSINFO);
-        let skip = 4 + if F::is_type_64_sized() { 4 /*padding*/ + 8 } else { 4 } + 4 + 4 + 4 * 4;
+        let skip =
+            4 + if F::is_type_64_sized() {
+                4 /*padding*/ + 8
+            } else {
+                4
+            } + 4
+                + 4
+                + 4 * 4;
         let data = note.desc();
         Self {
             fname: &data[skip..skip + 16],
