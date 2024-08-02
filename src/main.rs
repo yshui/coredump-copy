@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fmt::{Display, LowerHex},
     mem::MaybeUninit,
     ops::{Add, AddAssign, BitAnd, Not, Sub},
@@ -8,8 +8,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod notes;
+mod vm;
+
 use anyhow::Result;
-use object::read::elf::{ElfFile, FileHeader, ProgramHeader};
+use object::{
+    read::elf::{Dyn as _, ElfFile, FileHeader, ProgramHeader},
+    Object,
+};
 
 trait BitWidth {
     /// SAFETY: the slice must be at least `Self::BYTES` long.
@@ -17,6 +23,7 @@ trait BitWidth {
     /// SAFETY: the slice must be at least `Self::BYTES` long.
     unsafe fn to_bytes(&self, endian: impl object::Endian, bytes: &mut [MaybeUninit<u8>]);
     fn as_usize(&self) -> usize;
+    fn from_u64(val: u64) -> Self;
 }
 impl BitWidth for u32 {
     unsafe fn from_bytes(bytes: &[u8], endian: impl object::Endian) -> Self {
@@ -29,6 +36,9 @@ impl BitWidth for u32 {
     fn as_usize(&self) -> usize {
         *self as usize
     }
+    fn from_u64(val: u64) -> Self {
+        Self::try_from(val).unwrap()
+    }
 }
 impl BitWidth for u64 {
     unsafe fn from_bytes(bytes: &[u8], endian: impl object::Endian) -> Self {
@@ -40,6 +50,9 @@ impl BitWidth for u64 {
     }
     fn as_usize(&self) -> usize {
         *self as usize
+    }
+    fn from_u64(val: u64) -> Self {
+        val
     }
 }
 
@@ -84,221 +97,6 @@ impl<T: object::Endian> EndiannessExt for T {
     }
 }
 
-struct MappedFile<T> {
-    start: T,
-    end: T,
-    offset: T,
-    file: Vec<u8>,
-}
-
-enum MappedFileAny<'a> {
-    MappedFile64(&'a mut MappedFile<u64>),
-    MappedFile32(&'a mut MappedFile<u32>),
-}
-
-impl<'a> MappedFileAny<'a> {
-    fn file_mut(self) -> &'a mut Vec<u8> {
-        match self {
-            MappedFileAny::MappedFile32(m) => &mut m.file,
-            MappedFileAny::MappedFile64(m) => &mut m.file,
-        }
-    }
-    fn as_mut(&mut self) -> MappedFileAny<'_> {
-        match self {
-            MappedFileAny::MappedFile32(m) => MappedFileAny::MappedFile32(m),
-            MappedFileAny::MappedFile64(m) => MappedFileAny::MappedFile64(m),
-        }
-    }
-}
-
-struct NtFile<'data, T> {
-    count: T,
-    pagesz: T,
-    name: &'data [u8],
-    files: Vec<MappedFile<T>>,
-}
-
-enum NtFileAny<'data> {
-    NtFile32(NtFile<'data, u32>),
-    NtFile64(NtFile<'data, u64>),
-}
-
-impl<'data> From<NtFile<'data, u32>> for NtFileAny<'data> {
-    fn from(nt_file: NtFile<'data, u32>) -> Self {
-        NtFileAny::NtFile32(nt_file)
-    }
-}
-impl<'data> From<NtFile<'data, u64>> for NtFileAny<'data> {
-    fn from(nt_file: NtFile<'data, u64>) -> Self {
-        NtFileAny::NtFile64(nt_file)
-    }
-}
-
-fn parse_nt_file<'data, T: BitWidth + Display, Elf: FileHeader>(
-    endian: <Elf as FileHeader>::Endian,
-    note: &object::read::elf::Note<'data, Elf>,
-) -> Result<NtFile<'data, T>> {
-    let mut data = note.desc();
-    let count = endian
-        .read_bits::<T>(&mut data)
-        .ok_or_else(|| anyhow::anyhow!("not enough data"))?;
-    let pagesz = endian
-        .read_bits::<T>(&mut data)
-        .ok_or_else(|| anyhow::anyhow!("not enough data"))?;
-    let mut files = Vec::new();
-    for _ in 0..count.as_usize() {
-        let start = endian
-            .read_bits::<T>(&mut data)
-            .ok_or_else(|| anyhow::anyhow!("not enough data"))?;
-        let end = endian
-            .read_bits::<T>(&mut data)
-            .ok_or_else(|| anyhow::anyhow!("not enough data"))?;
-        let offset = endian
-            .read_bits::<T>(&mut data)
-            .ok_or_else(|| anyhow::anyhow!("not enough data"))?;
-        files.push(MappedFile {
-            start,
-            end,
-            offset,
-            file: vec![],
-        });
-    }
-    for file in &mut files {
-        let file_name = std::ffi::CStr::from_bytes_until_nul(data)?;
-        data = &data[file_name.to_bytes().len() + 1..];
-        file.file = file_name.to_bytes().to_vec();
-    }
-    Ok(NtFile {
-        count,
-        pagesz,
-        name: note.name(),
-        files,
-    })
-}
-
-fn serialize_nt_note<T: BitWidth + Copy>(
-    endian: impl object::Endian,
-    notes: &NtFile<'_, T>,
-    data: &mut Vec<u8>,
-) {
-    endian.write_bits((notes.name.len() + 1) as u32, data);
-    let descsz_offset = data.len();
-    endian.write_bits(0u32, data); // Set descsz to 0 for now
-    endian.write_bits(object::elf::NT_FILE, data);
-    data.extend_from_slice(notes.name);
-    data.push(0);
-    let padding = (4 - data.len() % 4) % 4;
-    data.extend(std::iter::repeat(0).take(padding));
-
-    let len1 = data.len();
-    assert_eq!(len1 % 4, 0);
-
-    endian.write_bits(notes.count, data);
-    endian.write_bits(notes.pagesz, data);
-    for file in &notes.files {
-        endian.write_bits(file.start, data);
-        endian.write_bits(file.end, data);
-        endian.write_bits(file.offset, data);
-    }
-    for file in &notes.files {
-        data.extend_from_slice(&file.file);
-        data.push(0);
-    }
-
-    let descsz = data.len() - len1;
-    let padding = (4 - (descsz % 4)) % 4;
-    data.extend(std::iter::repeat(0).take(padding));
-    data[descsz_offset..descsz_offset + 4]
-        .copy_from_slice(&endian.write_u32_bytes(descsz as u32)[..]);
-}
-impl NtFileAny<'_> {
-    fn serialize(&self, endian: impl object::Endian, data: &mut Vec<u8>) {
-        match self {
-            NtFileAny::NtFile32(nt_file) => serialize_nt_note(endian, nt_file, data),
-            NtFileAny::NtFile64(nt_file) => serialize_nt_note(endian, nt_file, data),
-        }
-    }
-    fn files_mut(&mut self) -> impl Iterator<Item = MappedFileAny<'_>> {
-        enum NtFilesIter<A, B> {
-            A(A),
-            B(B),
-        }
-        impl<'a, A: Iterator<Item = MappedFileAny<'a>>, B: Iterator<Item = MappedFileAny<'a>>>
-            Iterator for NtFilesIter<A, B>
-        {
-            type Item = MappedFileAny<'a>;
-            fn next(&mut self) -> Option<Self::Item> {
-                match self {
-                    Self::A(a) => a.next(),
-                    Self::B(b) => b.next(),
-                }
-            }
-        }
-        match self {
-            NtFileAny::NtFile32(f) => {
-                NtFilesIter::A(f.files.iter_mut().map(MappedFileAny::MappedFile32))
-            }
-            NtFileAny::NtFile64(f) => {
-                NtFilesIter::B(f.files.iter_mut().map(MappedFileAny::MappedFile64))
-            }
-        }
-    }
-}
-
-trait ZeroOne {
-    fn zero() -> Self;
-    fn one() -> Self;
-}
-
-impl ZeroOne for u64 {
-    fn zero() -> Self {
-        0
-    }
-    fn one() -> Self {
-        1
-    }
-}
-
-impl ZeroOne for u32 {
-    fn one() -> Self {
-        1
-    }
-    fn zero() -> Self {
-        0
-    }
-}
-
-fn get_soname(file: impl AsRef<Path>) -> Option<Vec<u8>> {
-    let file = file.as_ref();
-    let data = std::fs::read(file).ok()?;
-    let file = elf::ElfBytes::<elf::endian::AnyEndian>::minimal_parse(&data).ok()?;
-    let mut soname = None;
-    let mut strtab_vaddr = None;
-    for dt in file.dynamic().ok().flatten()?.iter() {
-        if dt.d_tag == elf::abi::DT_STRTAB {
-            log::info!("Found STRTAB: {:x}", dt.clone().d_ptr());
-            strtab_vaddr = Some(dt.d_ptr());
-        }
-    }
-    let strtab_vaddr = strtab_vaddr?;
-    let mut strtab = None;
-    for sh in file.section_headers()?.iter() {
-        if sh.sh_addr == strtab_vaddr {
-            strtab = Some(file.section_data_as_strtab(&sh).ok()?);
-        }
-    }
-    let strtab = strtab?;
-    for dt in file.dynamic().ok().flatten()?.iter() {
-        if dt.d_tag == elf::abi::DT_SONAME {
-            let name = strtab.get_raw(dt.d_val() as usize).ok()?;
-            soname = Some(name.to_vec());
-            log::info!("Found SONAME: {:?}", std::str::from_utf8(name));
-            break;
-        }
-    }
-    soname
-}
-
 struct NotesIter<'a, F: FileHeader>(object::read::elf::NoteIterator<'a, F>);
 
 impl<'a, F: FileHeader> Iterator for NotesIter<'a, F> {
@@ -307,6 +105,138 @@ impl<'a, F: FileHeader> Iterator for NotesIter<'a, F> {
         self.0.next().transpose()
     }
 }
+
+fn find_dt_debug_vaddr<F: FileHeader>(elf: &ElfFile<F>) -> Option<u64> {
+    let (ph, d) = elf.elf_program_headers().iter().find_map(|ph| {
+        ph.dynamic(elf.endian(), elf.data())
+            .ok()
+            .flatten()
+            .map(|d| (ph, d))
+    })?;
+    let vaddr = ph.p_vaddr(elf.endian()).into();
+    let data = ph.data(elf.endian(), elf.data()).ok()?;
+    log::debug!(
+        "Found dynamic section, vaddr {:x}, size {:x}",
+        vaddr,
+        ph.p_memsz(elf.endian()).into()
+    );
+    let mut offset = 0;
+    while offset < data.len() {
+        let (dyn_, _): (&F::Dyn, _) = object::pod::from_bytes(&data[offset..]).ok()?;
+        log::debug!(
+            "{:?}: {}, vaddr: {:x}",
+            elf::to_str::d_tag_to_str(dyn_.d_tag(elf.endian()).into() as _),
+            dyn_.d_val(elf.endian()).into(),
+            offset as u64 + vaddr,
+        );
+        if dyn_.d_tag(elf.endian()).into() == object::elf::DT_DEBUG as u64 {
+            return Some(
+                offset as u64 + vaddr + /*skip d_tag*/elf.architecture().address_size().unwrap() as u64,
+            );
+        }
+        offset += std::mem::size_of::<F::Dyn>();
+    }
+    None
+}
+
+#[repr(C)]
+#[derive(Debug)]
+struct RDebug<Ptr: BitWidth> {
+    r_version: u32,
+    r_map: Ptr,
+    r_brk: Ptr,
+    r_state: u32,
+    r_ldbase: Ptr,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+struct RawLinkMap<Ptr: BitWidth> {
+    l_addr: Ptr,
+    l_name: Ptr,
+    l_ld: Ptr,
+    l_next: Ptr,
+    l_prev: Ptr,
+}
+
+struct LinkMap {
+    addr: u64,
+    name: Vec<u8>,
+    ld: u64,
+    next: u64,
+    prev: u64,
+}
+
+impl LinkMap {
+    fn write<Ptr: BitWidth>(
+        &self,
+        endian: impl object::Endian,
+        data: &mut Vec<u8>,
+        base_addr: u64,
+        is_last: bool,
+    ) -> usize {
+        let initial_len = data.len();
+        let expected_len =
+            initial_len + std::mem::size_of::<RawLinkMap<Ptr>>() + self.name.len() + 1;
+        let expected_len =
+            (expected_len + std::mem::align_of::<Ptr>() - 1) & !(std::mem::align_of::<Ptr>() - 1);
+        endian.write_bits(Ptr::from_u64(self.addr), data);
+        endian.write_bits(
+            Ptr::from_u64(base_addr + std::mem::size_of::<RawLinkMap<Ptr>>() as u64),
+            data,
+        );
+        endian.write_bits(Ptr::from_u64(self.ld), data);
+        let next = if is_last {
+            0
+        } else {
+            (expected_len - initial_len) as u64 + base_addr
+        };
+        log::info!("next: {:x}, prev: {:x}", next, self.prev);
+        endian.write_bits(Ptr::from_u64(next), data);
+        endian.write_bits(Ptr::from_u64(self.prev), data);
+        data.extend(&self.name);
+        data.push(0);
+        let align = std::mem::align_of::<Ptr>();
+        let padding = (align - data.len() % align) % align;
+        data.extend(std::iter::repeat(0).take(padding));
+
+        assert_eq!(data.len(), expected_len);
+        data.len() - initial_len
+    }
+}
+
+/// Pod
+///
+/// # Safety
+///
+/// Must be plain old data.
+unsafe trait Pod: Sized {
+    fn read_from_vm(vm: &vm::Vm, vaddr: u64, endian: impl object::Endian) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let mut buf = std::mem::MaybeUninit::<Self>::uninit();
+        let this = unsafe {
+            let buf_slice = std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast(),
+                std::mem::size_of::<Self>(),
+            );
+            vm.read_into_uninit(vaddr, buf_slice)?;
+            buf.assume_init()
+        };
+        Ok(this)
+    }
+    fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+unsafe impl<Ptr: BitWidth> Pod for RDebug<Ptr> {}
+unsafe impl<Ptr: BitWidth> Pod for RawLinkMap<Ptr> {}
 
 fn handle_elf<F: object::read::elf::FileHeader>(
     elf: &ElfFile<F>,
@@ -320,89 +250,201 @@ where
         + PartialOrd
         + Sub<Output = <F as FileHeader>::Word>
         + Not<Output = <F as FileHeader>::Word>
-        + ZeroOne
         + LowerHex
-        + TryFrom<usize>,
+        + TryFrom<usize>
+        + TryFrom<u64>
+        + BitWidth
+        + std::fmt::Debug,
+    <<F as FileHeader>::Word as TryFrom<u64>>::Error: std::error::Error + Send + Sync,
     <<F as FileHeader>::Word as TryFrom<usize>>::Error: std::error::Error + Send + Sync,
 {
-    let mut nt_file: Option<NtFileAny<'_>> = None;
-    let first_offset = elf.elf_program_headers()[0].p_offset(elf.endian());
+    let mut nt_file: Option<notes::nt_file::NtFileAny<'_>> = None;
+    let mut fname = None;
     for ph in elf.elf_program_headers() {
         let notes = ph.notes(elf.endian(), elf.data())?;
         if let Some(notes) = notes {
             for note in NotesIter(notes) {
                 let note = note?;
+                if note.n_type(elf.endian()) == object::elf::NT_PRPSINFO {
+                    let info = notes::nt_prpsinfo::PsInfo::parse(&note, elf.endian());
+                    log::info!("fname is: {}", std::str::from_utf8(info.fname).unwrap());
+                    fname = Some(info.fname);
+                    continue;
+                }
                 if note.n_type(elf.endian()) != object::elf::NT_FILE {
                     continue;
                 }
                 if nt_file.is_some() {
                     return Err(anyhow::anyhow!("Mutiple NT_FILE notes found in core"));
                 }
-                nt_file = Some(if F::is_type_64_sized() {
-                    parse_nt_file::<u64, _>(elf.endian(), &note)?.into()
-                } else {
-                    parse_nt_file::<u32, _>(elf.endian(), &note)?.into()
-                });
+                nt_file = Some(notes::nt_file::NtFileAny::parse(&note, elf.endian())?);
             }
         }
     }
 
+    let Some(nt_file) = nt_file else {
+        return Err(anyhow::anyhow!("No NT_FILE note found in core"));
+    };
+    let Some(fname) = fname else {
+        return Err(anyhow::anyhow!("No NT_PRPSINFO note found in core"));
+    };
+    let nul_pos = fname.iter().position(|&b| b == 0).unwrap_or(fname.len());
+    let fname = &fname[..nul_pos];
+
     let base_dir = base_dir.as_ref();
-    if let Some(nt_file) = nt_file.as_mut() {
-        let mut copied = HashSet::<PathBuf>::new();
-        for mut file in nt_file.files_mut() {
-            let src_path = std::path::Path::new(OsStr::from_bytes(file.as_mut().file_mut()));
-            let Some(parent) = src_path.parent() else {
-                continue;
-            };
-            let Some(filename) = src_path.file_name() else {
-                continue;
-            };
-            let path = if parent != base_dir {
-                base_dir.join(filename)
-            } else {
-                src_path.to_path_buf()
-            };
-            if !copied.contains(src_path) {
-                if src_path != path {
-                    log::info!("Copying {} to {}", src_path.display(), path.display());
-                    std::fs::copy(src_path, &path).unwrap_or_else(|e| {
-                        log::error!(
-                            "Couldn't copy file from {} to {}: {e}",
-                            src_path.display(),
-                            path.display()
-                        );
-                        0
-                    });
-                    if path.exists() {
-                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-                        if let Some(soname) = get_soname(&path) {
-                            if filename.as_bytes() != &soname {
-                                let target = base_dir.join(OsStr::from_bytes(&soname));
-                                std::os::unix::fs::symlink(filename, &target).unwrap_or_else(|e| {
-                                    log::error!(
-                                        "Couldn't create symlink from {:?} to {}: {e}",
-                                        filename,
-                                        target.display()
-                                    );
-                                });
-                            }
-                        }
-                        //unsafe {
-                        //    let cpath =
-                        //        std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-                        //    patchelf_set_input(cpath.as_ptr());
-                        //    patchelf_set_rpath(c"$ORIGIN".as_ptr() as *const i8);
-                        //    patchelf_run();
-                        //    patchelf_clear();
-                        //}
-                    }
+    let mut copied = HashSet::<PathBuf>::new();
+    let Some(main_exec) = nt_file.files().find(|f| {
+        let src_path = std::path::Path::new(OsStr::from_bytes(f.file()));
+        let Some(filename) = src_path.file_name() else {
+            return false;
+        };
+        if filename.as_bytes().starts_with(fname) {
+            return true;
+        }
+        false
+    }) else {
+        return Err(anyhow::anyhow!(
+            "Couldn't find main executable in NT_FILE notes"
+        ));
+    };
+    log::info!(
+        "Main executable is: {}",
+        std::str::from_utf8(main_exec.file())?
+    );
+
+    let main_exec = Path::new(OsStr::from_bytes(main_exec.file()));
+    if main_exec.parent().unwrap() != base_dir {
+        let path = base_dir.join(main_exec.file_name().unwrap());
+        log::info!("Copying {} to {}", main_exec.display(), path.display());
+        std::fs::copy(main_exec, &path).unwrap_or_else(|e| {
+            log::error!(
+                "Couldn't copy file from {} to {}: {e}",
+                main_exec.display(),
+                path.display()
+            );
+            0
+        });
+        if path.exists() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+        copied.insert(main_exec.to_path_buf());
+    }
+    let main_exec = std::fs::read(main_exec)?;
+    let main_exec = object::File::parse(&*main_exec)?;
+    let Some(dt_debug) = (match &main_exec {
+        object::File::Elf32(elf) => find_dt_debug_vaddr(elf),
+        object::File::Elf64(elf) => find_dt_debug_vaddr(elf),
+        _ => None,
+    }) else {
+        return Err(anyhow::anyhow!("Couldn't find DT_DEBUG in main executable"));
+    };
+    log::info!("vaddr of DT_DEBUG is: {:x}", dt_debug);
+
+    let vm = vm::Vm::load_object(elf)?;
+    let r_debug = vm.read_ptr(dt_debug, elf.endian())?;
+    let mut r_debug = RDebug::<F::Word>::read_from_vm(&vm, r_debug, elf.endian())?;
+    log::info!("r_debug: {r_debug:x?}");
+    let mut link_map = r_debug.r_map;
+    let mut name_buf = Vec::new();
+    let mut link_map_size = std::mem::size_of::<RDebug<F::Word>>();
+    let mut link_maps = Vec::new();
+    while link_map.into() != 0 {
+        let lmap = RawLinkMap::<F::Word>::read_from_vm(&vm, link_map.into(), elf.endian())?;
+        vm.read_until_nul(lmap.l_name.into(), &mut name_buf)?;
+        log::info!(
+            "link_map: {lmap:x?}, file name: {:?}",
+            std::str::from_utf8(&name_buf)
+        );
+        link_maps.push(LinkMap {
+            addr: lmap.l_addr.into(),
+            name: name_buf.clone(),
+            ld: lmap.l_ld.into(),
+            next: lmap.l_next.into(),
+            prev: lmap.l_prev.into(),
+        });
+        link_map = lmap.l_next;
+
+        let src_path = std::path::Path::new(OsStr::from_bytes(&name_buf));
+        let Some(filename) = src_path.file_name() else {
+            continue;
+        };
+        let Some(parent) = src_path.parent() else {
+            continue;
+        };
+        let path = if parent != base_dir {
+            base_dir.join(filename)
+        } else {
+            src_path.to_path_buf()
+        };
+        if !copied.contains(src_path) {
+            if src_path != path {
+                log::info!("Copying {} to {}", src_path.display(), path.display());
+                std::fs::copy(src_path, &path).unwrap_or_else(|e| {
+                    log::error!(
+                        "Couldn't copy file from {} to {}: {e}",
+                        src_path.display(),
+                        path.display()
+                    );
+                    0
+                });
+                if path.exists() {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok();
                 }
-                copied.insert(src_path.to_path_buf());
             }
-            *file.file_mut() = path.as_os_str().as_bytes().to_vec();
+            copied.insert(src_path.to_path_buf());
         }
     }
+
+    for lmap in link_maps.iter_mut() {
+        let src_path = std::path::Path::new(OsStr::from_bytes(&lmap.name));
+        if let Some(parent) = src_path.parent() {
+            if let Some(filename) = src_path.file_name() {
+                if parent != base_dir {
+                    lmap.name = base_dir.join(filename).as_os_str().as_bytes().to_vec();
+                }
+            }
+        }
+        link_map_size += std::mem::size_of::<RawLinkMap<F::Word>>()
+            + vm.align_to_ptr(lmap.name.len() as u64 + 1) as usize;
+    }
+    // Synthesize a new link_map and replace the file names.
+    // First, find a free address range.
+    let free_addr = vm.find_free(link_map_size as u64).ok_or_else(|| {
+        anyhow::anyhow!("Couldn't find a free address range for the new link_map")
+    })?;
+    let mut link_map_end = free_addr;
+    log::info!(
+        "Free address range: {:x}, size needed: {}, link map entries {}",
+        link_map_end,
+        link_map_size,
+        link_maps.len()
+    );
+    r_debug.r_map = <F as FileHeader>::Word::try_from(
+        free_addr + std::mem::size_of::<RDebug<F::Word>>() as u64,
+    )
+    .unwrap();
+    link_map_end = free_addr + std::mem::size_of::<RDebug<F::Word>>() as u64;
+
+    let mut new_link_map = Vec::new();
+    new_link_map.extend_from_slice(r_debug.as_bytes());
+    let mut prev = 0;
+    let link_maps_len = link_maps.len();
+    for (i, lmap) in link_maps.iter_mut().enumerate() {
+        lmap.prev = prev;
+        prev = link_map_end;
+        let size = lmap.write::<F::Word>(
+            elf.endian(),
+            &mut new_link_map,
+            link_map_end,
+            i == link_maps_len - 1,
+        );
+        link_map_end += size as u64;
+    }
+    log::info!(
+        "Link map end: {:x}, actual size: {}",
+        link_map_end,
+        link_map_end - free_addr
+    );
 
     let output_file = std::fs::File::create(base_dir.join("core"))?;
     let mut output_file = object::write::StreamingBuffer::new(output_file);
@@ -414,7 +456,9 @@ where
     let fh = elf.elf_header();
     let endian = elf.endian();
     writer.reserve_file_header();
-    writer.reserve_program_headers(fh.e_phnum(endian) as _);
+    log::info!("Header size: {}", writer.reserved_len());
+    writer.reserve_program_headers((fh.e_phnum(endian) + 1) as _);
+    log::info!("Program headers size: {}", writer.reserved_len());
     writer.write_file_header(&object::write::elf::FileHeader {
         abi_version: fh.e_ident().abi_version,
         os_abi: fh.e_ident().os_abi,
@@ -423,71 +467,59 @@ where
         e_entry: fh.e_entry(endian).into(),
         e_flags: fh.e_flags(endian),
     })?;
-    let mut curr_offset = first_offset;
-    let mut notes_data = Vec::new();
+    let mut curr_offset = writer.reserved_len() as u64;
     for ph in elf.elf_program_headers() {
-        let notes = ph.notes(elf.endian(), elf.data())?;
-        if let Some(notes) = notes {
-            for note in NotesIter(notes) {
-                let note = note?;
-                if note.n_type(elf.endian()) != object::elf::NT_FILE {
-                    endian.write_bits(note.n_namesz(endian), &mut notes_data);
-                    endian.write_bits(note.n_descsz(endian), &mut notes_data);
-                    endian.write_bits(note.n_type(endian), &mut notes_data);
-                    notes_data.extend_from_slice(note.name());
-                    notes_data.push(0);
-                    let padding = (4 - (note.name().len() + 1) % 4) % 4;
-                    notes_data.extend(std::iter::repeat(0).take(padding));
-                    notes_data.extend_from_slice(note.desc());
-                    let padding = (4 - note.desc().len() % 4) % 4;
-                    notes_data.extend(std::iter::repeat(0).take(padding));
-                    assert_eq!(notes_data.len() % 4, 0);
-                    continue;
-                }
-                let notes = nt_file.as_ref().unwrap();
-                notes.serialize(elf.endian(), &mut notes_data);
-                assert_eq!(notes_data.len() % 4, 0);
-            }
-            writer.write_program_header(&object::write::elf::ProgramHeader {
-                p_type: object::elf::PT_NOTE,
-                p_flags: 0,
-                p_offset: curr_offset.into(),
-                p_vaddr: 0,
-                p_paddr: 0,
-                p_filesz: notes_data.len() as _,
-                p_memsz: 0,
-                p_align: 0,
-            });
-            curr_offset += <F as FileHeader>::Word::try_from(notes_data.len())?;
-        } else {
-            let align = ph.p_align(endian);
-            let zero = <F as FileHeader>::Word::zero();
-            let one = <F as FileHeader>::Word::one();
-            if align > zero {
-                curr_offset = (curr_offset + align - one) & !(align - one);
-            }
-            writer.write_program_header(&object::write::elf::ProgramHeader {
-                p_type: ph.p_type(endian),
-                p_flags: ph.p_flags(endian),
-                p_offset: curr_offset.into(),
-                p_vaddr: ph.p_vaddr(endian).into(),
-                p_paddr: ph.p_paddr(endian).into(),
-                p_filesz: ph.p_filesz(endian).into(),
-                p_memsz: ph.p_memsz(endian).into(),
-                p_align: ph.p_align(endian).into(),
-            });
-            curr_offset += ph.p_filesz(endian);
+        let align = ph.p_align(endian).into();
+        if align > 0 {
+            curr_offset = (curr_offset + align - 1) & !(align - 1);
         }
+        writer.write_program_header(&object::write::elf::ProgramHeader {
+            p_type: ph.p_type(endian),
+            p_flags: ph.p_flags(endian),
+            p_offset: curr_offset,
+            p_vaddr: ph.p_vaddr(endian).into(),
+            p_paddr: ph.p_paddr(endian).into(),
+            p_filesz: ph.p_filesz(endian).into(),
+            p_memsz: ph.p_memsz(endian).into(),
+            p_align: ph.p_align(endian).into(),
+        });
+        curr_offset += ph.p_filesz(endian).into();
     }
+    let curr_offset = (curr_offset + 4095) & !4095;
+    writer.write_program_header(&object::write::elf::ProgramHeader {
+        p_type: object::elf::PT_LOAD,
+        p_flags: object::elf::PF_R | object::elf::PF_W,
+        p_offset: curr_offset,
+        p_vaddr: free_addr,
+        p_paddr: 0,
+        p_filesz: (link_map_end - free_addr) as u64,
+        p_memsz: ((link_map_end - free_addr) as u64 + 4095) & !4095,
+        p_align: 4096,
+    });
     for ph in elf.elf_program_headers() {
-        let notes = ph.notes(elf.endian(), elf.data())?;
-        if notes.is_some() {
-            writer.write(&notes_data);
+        writer.write_align(<F as FileHeader>::Word::into(ph.p_align(endian)) as _);
+        let vaddr = ph.p_vaddr(endian).into();
+        let memsz = ph.p_memsz(endian).into();
+        if vaddr <= dt_debug && vaddr + memsz > dt_debug {
+            // Overwrite the DT_DEBUG pointer.
+            let mut data_copy = ph.data(endian, elf.data()).unwrap().to_vec();
+            let offset = (dt_debug - vaddr) as usize;
+            let ptr_size = std::mem::size_of::<F::Word>();
+            let ptr = <F as FileHeader>::Word::try_from(free_addr).unwrap();
+            unsafe {
+                ptr.to_bytes(
+                    endian,
+                    &mut *(&mut data_copy[offset..offset + ptr_size] as *mut _ as *mut _),
+                );
+            }
+            writer.write(&data_copy);
         } else {
-            writer.write_align(<F as FileHeader>::Word::into(ph.p_align(endian)) as _);
             writer.write(ph.data(endian, elf.data()).unwrap())
         }
     }
+    writer.write_align(4096);
+    writer.write(&new_link_map);
+
     Ok(())
 }
 
