@@ -10,6 +10,7 @@ mod notes;
 mod vm;
 
 use anyhow::Result;
+use notes::nt_file::NtFileAny;
 use object::{
     read::elf::{Dyn as _, ElfFile, FileHeader, ProgramHeader},
     Object,
@@ -120,19 +121,24 @@ impl<'a, F: FileHeader> Iterator for NotesIter<'a, F> {
     }
 }
 
-fn find_dt_debug_vaddr<F: FileHeader>(elf: &ElfFile<F>) -> Option<u64> {
-    let (ph, d) = elf.elf_program_headers().iter().find_map(|ph| {
+fn find_dt_debug_vaddr<F: FileHeader>(
+    main_exec_name: &[u8],
+    elf: &ElfFile<F>,
+    mappings: &NtFileAny<'_>,
+) -> Option<u64> {
+    let ph = elf.elf_program_headers().iter().find_map(|ph| {
         ph.dynamic(elf.endian(), elf.data())
             .ok()
             .flatten()
-            .map(|d| (ph, d))
+            .map(|_| ph)
     })?;
     let vaddr = ph.p_vaddr(elf.endian()).into();
     let data = ph.data(elf.endian(), elf.data()).ok()?;
-    log::debug!(
-        "Found dynamic section, vaddr {:x}, size {:x}",
+    let ph_offset = ph.p_offset(elf.endian()).into();
+    log::info!(
+        "Found dynamic section, vaddr {:x}, size {:x}, offset: {ph_offset:x}",
         vaddr,
-        ph.p_memsz(elf.endian()).into()
+        ph.p_memsz(elf.endian()).into(),
     );
     let mut offset = 0;
     while offset < data.len() {
@@ -144,8 +150,9 @@ fn find_dt_debug_vaddr<F: FileHeader>(elf: &ElfFile<F>) -> Option<u64> {
             offset as u64 + vaddr,
         );
         if dyn_.d_tag(elf.endian()).into() == object::elf::DT_DEBUG as u64 {
-            return Some(
-                offset as u64 + vaddr + /*skip d_tag*/elf.architecture().address_size().unwrap() as u64,
+            return mappings.file_offset_to_vaddr(
+                main_exec_name,
+                ph_offset + offset as u64 + /*skip d_tag*/elf.architecture().address_size().unwrap() as u64,
             );
         }
         offset += std::mem::size_of::<F::Dyn>();
@@ -188,8 +195,9 @@ struct RawLinkMap<Ptr: BitWidth> {
 #[derive(Debug)]
 struct LinkMap {
     addr: u64,
-    name: Vec<u8>,
+    name: OsString,
     ld: u64,
+    #[allow(dead_code)]
     next: u64,
     prev: u64,
 }
@@ -221,7 +229,7 @@ impl LinkMap {
         log::info!("next: {:x}, prev: {:x}", next, self.prev);
         endian.write_bits(Ptr::from_u64(next), data);
         endian.write_bits(Ptr::from_u64(self.prev), data);
-        data.extend(&self.name);
+        data.extend(self.name.as_bytes());
         data.push(0);
         let align = std::mem::align_of::<Ptr>();
         let padding = (align - data.len() % align) % align;
@@ -342,7 +350,8 @@ where
         std::str::from_utf8(main_exec.file())?
     );
 
-    let main_exec = Path::new(OsStr::from_bytes(main_exec.file()));
+    let main_exec_name = main_exec.file();
+    let main_exec = Path::new(OsStr::from_bytes(main_exec_name));
     if main_exec.parent().unwrap() != base_dir {
         let path = base_dir.join(main_exec.file_name().unwrap());
         log::info!("Copying {} to {}", main_exec.display(), path.display());
@@ -362,8 +371,8 @@ where
     let main_exec = std::fs::read(main_exec)?;
     let main_exec = object::File::parse(&*main_exec)?;
     let Some(dt_debug) = (match &main_exec {
-        object::File::Elf32(elf) => find_dt_debug_vaddr(elf),
-        object::File::Elf64(elf) => find_dt_debug_vaddr(elf),
+        object::File::Elf32(elf) => find_dt_debug_vaddr(main_exec_name, elf, &nt_file),
+        object::File::Elf64(elf) => find_dt_debug_vaddr(main_exec_name, elf, &nt_file),
         _ => None,
     }) else {
         return Err(anyhow::anyhow!("Couldn't find DT_DEBUG in main executable"));
@@ -383,7 +392,7 @@ where
         vm.read_until_nul(raw_lmap.l_name.into(), &mut name_buf)?;
         let lmap = LinkMap {
             addr: raw_lmap.l_addr.into(),
-            name: name_buf.clone(),
+            name: OsStr::from_bytes(&name_buf).to_os_string(),
             ld: raw_lmap.l_ld.into(),
             next: raw_lmap.l_next.into(),
             prev: raw_lmap.l_prev.into(),
@@ -427,11 +436,11 @@ where
     }
 
     for lmap in link_maps.iter_mut() {
-        let src_path = std::path::Path::new(OsStr::from_bytes(&lmap.name));
+        let src_path = std::path::Path::new(&lmap.name);
         if let Some(parent) = src_path.parent() {
             if let Some(filename) = src_path.file_name() {
                 if parent != base_dir {
-                    lmap.name = base_dir.join(filename).as_os_str().as_bytes().to_vec();
+                    lmap.name = base_dir.join(filename).as_os_str().to_os_string();
                 }
             }
         }

@@ -1,6 +1,6 @@
 [package]
 name = "coredump-copy"
-version = "0.1.4"
+version = "0.1.6"
 edition = "2021"
 description = "Copy coredumps for debugging on a different machine"
 license = "MIT"

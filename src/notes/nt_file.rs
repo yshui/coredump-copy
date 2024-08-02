@@ -173,4 +173,22 @@ impl<'a> NtFileAny<'a> {
             }
         }
     }
+    pub fn file_offset_to_vaddr(&self, fname: &[u8], offset: u64) -> Option<u64> {
+        self.files().find_map(|file| {
+            if file.file() == fname {
+                let (start, end, page_offset) = match file {
+                    MappedFileAny::MappedFile32(f) => {
+                        (f.start as u64, f.end as u64, f.offset as u64)
+                    }
+                    MappedFileAny::MappedFile64(f) => (f.start, f.end, f.offset),
+                };
+                let mapping_size = end - start;
+                let file_offset = page_offset * self.pagesz();
+                if offset >= file_offset && offset < file_offset + mapping_size {
+                    return Some(start + offset - file_offset);
+                }
+            }
+            None
+        })
+    }
 }

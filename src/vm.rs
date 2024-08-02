@@ -1,9 +1,8 @@
 use crate::EndiannessExt as _;
 use anyhow::Result;
-use core::slice;
 use object::{
     read::elf::{FileHeader, ProgramHeader as _},
-    Object, ObjectSegment as _,
+    Object,
 };
 use std::{collections::BTreeMap, mem::MaybeUninit};
 

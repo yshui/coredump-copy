@@ -13,10 +13,10 @@ coredump-copy <input> <output-dir>
 
 # Why
 
-Sometimes you might want to copy a core dump file to another machine, and debug it there. For example, if your program crashed on a remote machine, or in CI.
+Sometimes you might want to copy a core dump file to another machine, and debug it there. For example, when your program crashed on a remote machine, or in CI.
 
 It is not enough to just copy the core dump file and the main binary, you also need to copy all the shared libraries and also maintain the directory structure, and set a prefix in gdb so it can find them. This program does all of that for you, automatically.
 
 # Caveat
 
-This program is not fool proof. Since it mangles with the executable files, it is possible that it can do something wrong and break them. Report a bug if this doesn't work.
+This program is not fool proof. Since it mangles with the core dump files, it is possible that it can do something wrong and break them. Report a bug if this doesn't work.
