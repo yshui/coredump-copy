@@ -8,7 +8,7 @@ coredump-copy <input> <output-dir>
 ```
 
 
-- `<input>`: The core dump file to copy. This will copy the core dump file along with all the files it reference. The paths in the copied core dump will be updated to use the new paths. RPATHs of any library/executable files will be changed to `$ORIGIN`. The core dump file will be named `<output-dir>/core`.
+- `<input>`: The core dump file to copy. This will copy the core dump file along with all the files it reference. The paths in the copied core dump will be updated to use the new paths. The core dump file will be named `<output-dir>/core`.
 - `<output-dir>`: Where files should be copied to.
 
 # Why
